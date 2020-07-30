@@ -35,6 +35,7 @@
 #include <numeric> // For std::iota
 #include <tuple>
 #include <unordered_set>
+#include <stdio.h>
 
 namespace onnx2trt
 {
@@ -417,6 +418,64 @@ DEFINE_BUILTIN_OP_IMPORTER(ConstantOfShape)
 
     nvinfer1::ITensor* value = &convertToTensor(valueWeights, ctx);
     return {{constantOfShape(ctx, value, shape)}};
+}
+
+DEFINE_BUILTIN_OP_IMPORTER(ModulatedDeformableConv2d) {
+    OnnxAttrs attrs(node, ctx);
+    ASSERT(inputs.at(0).is_tensor(), ErrorCode::kUNSUPPORTED_NODE);  // input
+    ASSERT(inputs.at(1).is_tensor(), ErrorCode::kUNSUPPORTED_NODE);  // offset
+    ASSERT(inputs.at(2).is_tensor(), ErrorCode::kUNSUPPORTED_NODE);  // mask
+    ASSERT(inputs.at(3).is_weights(), ErrorCode::kUNSUPPORTED_NODE); // weights
+    if (inputs.size() == 5) {
+        ASSERT(inputs.at(4).is_weights(), ErrorCode::kUNSUPPORTED_NODE); // bias
+    }
+
+    const std::string pluginName = "ModulatedDeformableConv2d_TRT";
+    const std::string pluginVersion = "001";
+
+    std::vector<nvinfer1::PluginField> f;
+    auto stride = attrs.get<std::vector<int>>("stride");
+    auto padding = attrs.get<std::vector<int>>("padding");
+    auto dilation = attrs.get<std::vector<int>>("dilation");
+    f.emplace_back("stride", stride.data(), nvinfer1::PluginFieldType::kINT32, 2);
+    f.emplace_back("padding", padding.data(), nvinfer1::PluginFieldType::kINT32, 2);
+    f.emplace_back("dilation", dilation.data(), nvinfer1::PluginFieldType::kINT32, 2);
+
+    auto weights = inputs.at(3).weights();
+    ASSERT(weights.type == 1, ErrorCode::kUNSUPPORTED_NODE);  // FLOAT
+    ASSERT(weights.shape.nbDims == 4, ErrorCode::kUNSUPPORTED_NODE);
+    std::vector<int> kernel_size = {weights.shape.d[2], weights.shape.d[3]};
+    f.emplace_back("kernel_size", kernel_size.data(), nvinfer1::PluginFieldType::kINT32, 2);
+    int out_channels = weights.shape.d[0], in_channels = weights.shape.d[1];
+    f.emplace_back("out_channels", &out_channels, nvinfer1::PluginFieldType::kINT32,
+        1); // weights' out channels, the real out channels should multi group
+    f.emplace_back("in_channels", &in_channels, nvinfer1::PluginFieldType::kINT32, 1); // dito
+    f.emplace_back("weights", weights.values, nvinfer1::PluginFieldType::kFLOAT32, weights.count());
+
+    std::vector<float> bias_zero(weights.shape.d[0], 0.0);
+    if (inputs.size() == 5)
+    {
+        auto bias = inputs.at(4).weights();
+        ASSERT(bias.type == 1, ErrorCode::kUNSUPPORTED_NODE);  // FLOAT
+        ASSERT(static_cast<int>(bias.count()) == weights.shape.d[0], ErrorCode::kUNSUPPORTED_NODE);
+        f.emplace_back("bias", bias.values, nvinfer1::PluginFieldType::kFLOAT32, bias.count());
+    } else {
+        f.emplace_back("bias", bias_zero.data(), nvinfer1::PluginFieldType::kFLOAT32, bias_zero.size());
+    }
+
+    int im2col_step = attrs.get<int>("im2col_step");
+    f.emplace_back("im2col_step", &im2col_step, nvinfer1::PluginFieldType::kINT32, 1);
+
+    nvinfer1::IPluginV2* plugin = importPluginFromRegistry(ctx, pluginName, pluginVersion, node.name(), f);
+    ASSERT(plugin != nullptr && "In plugin was not found in the plugin registry!",
+        ErrorCode::kUNSUPPORTED_NODE);
+
+    std::vector<nvinfer1::ITensor*> tensors;
+    tensors.push_back(&inputs.at(0).tensor());
+    tensors.push_back(&inputs.at(1).tensor());
+    tensors.push_back(&inputs.at(2).tensor());
+
+    RETURN_FIRST_OUTPUT(ctx->network()->addPluginV2(tensors.data(), tensors.size(), *plugin));
 }
 
 DEFINE_BUILTIN_OP_IMPORTER(Conv)
@@ -2512,11 +2571,12 @@ DEFINE_BUILTIN_OP_IMPORTER(Resize)
 
     auto mode = attrs.get<std::string>("mode", "nearest");
     auto resizeMode = mode == "nearest" ? nvinfer1::ResizeMode::kNEAREST : nvinfer1::ResizeMode::kLINEAR;
+    auto transformationMode = attrs.get<std::string>("coordinate_transformation_mode", "half_pixel");
 
     if (ctx->getOpsetVersion() >= 11)
     {
-        auto transformationMode = attrs.get<std::string>("coordinate_transformation_mode", "half_pixel");
-        ASSERT((transformationMode == "asymmetric") && "This version of TensorRT only supports asymmetric resize!",
+        ASSERT(((transformationMode == "asymmetric") || (transformationMode == "align_corners"))
+                && "This version of TensorRT only supports asymmetric and align_corners resize!",
             ErrorCode::kUNSUPPORTED_NODE);
         ASSERT(mode != "cubic" && "This version of TensorRT does not support cubic interpolation!",
             ErrorCode::kUNSUPPORTED_NODE);
@@ -2531,11 +2591,15 @@ DEFINE_BUILTIN_OP_IMPORTER(Resize)
             auto* resizeShape = &convertToTensor(inputs.at(3), ctx);
             layer->setInput(1, *resizeShape);
             layer->setResizeMode(resizeMode);
+            if (transformationMode=="align_corners")
+                layer->setAlignCorners(true);
             RETURN_FIRST_OUTPUT(layer);
         }
     }
 
     // Resizes that use scale factors have the same import logic between opsets
+    ASSERT(transformationMode != "align_corners" && "Align_corners should use size information not scale factors!",
+        ErrorCode::kUNSUPPORTED_NODE);
     auto scales = ctx->getOpsetVersion() >= 11 ? inputs.at(2) : inputs.at(1);
     ASSERT(scales.is_weights() && "Resize scales must be an initializer!", ErrorCode::kUNSUPPORTED_NODE);
     ShapedWeights scales_weights = scales.weights();
@@ -3440,7 +3504,7 @@ DEFINE_BUILTIN_OP_IMPORTER(Where)
     nvinfer1::ITensor* y = &convertToTensor(inputs.at(2), ctx);
     // TRT does not support BOOL input types for this node
     ASSERT(x->getType() == y->getType() && x->getType() != nvinfer1::DataType::kBOOL, ErrorCode::kUNSUPPORTED_NODE);
-    
+
     broadcastTensors(ctx, x, y, condition);
 
     nvinfer1::Dims cDims = condition->getDimensions();
